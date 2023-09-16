@@ -36,8 +36,7 @@ type OpCode = byte
 type WebSocketConnection struct {
 	conn               net.Conn
 	readCh             chan []byte
-	writeCh            chan []byte
-	writeChTxt         chan []byte
+	writeCh            chan WebSocketFrame
 	closeCh            chan struct{}
 	closeDone          chan struct{}
 	compressionEnabled bool
@@ -98,7 +97,6 @@ func (s *WebSocketServer) Run() {
 	s.bufferPool = *NewFrameBufferPool(s.config.BufferPoolSize, s.config.BufferSize)
 	http.HandleFunc("/", s.handleWebSocketUpgrade)
 
-	// Start the HTTP server
 	err := http.ListenAndServe(s.addr, nil)
 	if err != nil {
 		s.config.Logger.Fatal("Error starting the server:", err)
@@ -157,6 +155,13 @@ func (fbp *FrameBufferPool) Put(buffer []byte) {
 	default:
 		// If the pool is full, discard the buffer
 	}
+}
+
+func webSocketCodeIsValid(code uint16) bool {
+	return !((code >= 0 && code <= 999) ||
+		(code >= 1004 && code <= 1006) ||
+		(code >= 1015 && code <= 2999) ||
+		(code >= 5000))
 }
 
 func (s *WebSocketServer) handleWebSocketUpgrade(w http.ResponseWriter, r *http.Request) {
@@ -232,27 +237,27 @@ func generateWebSocketHandshakeResponse(r *http.Request) (map[string]string, err
 func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frame WebSocketFrame, frameErr error) {
 	// Read the initial two bytes of the WebSocket frame to determine the opcode and mask flag
 
-	header := make([]byte, 1)
-	_, err := conn.Read(header)
+	headerStart := make([]byte, 1)
+	_, err := conn.Read(headerStart)
 
-	header2 := make([]byte, 1)
-	_, err = conn.Read(header2)
+	headerEnd := make([]byte, 1)
+	_, err = conn.Read(headerEnd)
 	if err != nil {
 		return WebSocketFrame{}, err
 	}
 
-	if (header[0] & 0x70) != 0 {
+	if (headerStart[0] & 0x70) != 0 {
 		return WebSocketFrame{}, errors.New("RSV must be 0")
 	}
 	// Get the opcode from the first 4 bits of the first byte
-	opcode := header[0] & 0xf
+	opcode := headerStart[0] & 0xf
 
 	// fin bit
-	fin := (header[0] & 0x80) != 0
+	fin := (headerStart[0] & 0x80) != 0
 
 	// Get the payload length and whether the frame is masked from the second byte
-	mask := header2[0]&0x80 != 0
-	payloadLength := int(header2[0] & 0x7f)
+	mask := headerEnd[0]&0x80 != 0
+	payloadLength := int(headerEnd[0] & 0x7f)
 
 	// Handle extended payload length if indicated by payloadLength = 126 or 127
 	if payloadLength == 126 {
@@ -264,25 +269,26 @@ func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frame WebSocketFram
 			return WebSocketFrame{}, err
 		}
 		payloadLength = int(extendedLen[0])<<8 | int(extendedLen[1])
+
 	} else if payloadLength == 127 {
 		extendedLen := make([]byte, 0, 8)
+
 		for len(extendedLen) < 8 {
 			octet := make([]byte, 1)
 			n, err := conn.Read(octet)
 			if err != nil {
 				return WebSocketFrame{}, err
-			}
-			if n != 1 {
+			} else if n != 1 {
 				// Handle the case where we couldn't read a single octet
 				return WebSocketFrame{}, errors.New("Unexpected EOF on read")
 			}
 			extendedLen = append(extendedLen, octet...)
 		}
 
-		payloadLength = int(extendedLen[0])<<56 | int(extendedLen[1])<<48 |
-			int(extendedLen[2])<<40 | int(extendedLen[3])<<32 |
-			int(extendedLen[4])<<24 | int(extendedLen[5])<<16 |
-			int(extendedLen[6])<<8 | int(extendedLen[7])
+		payloadLength = 0
+		for i := 0; i < 8; i++ {
+			payloadLength |= int(extendedLen[i]) << uint(56-(i*8))
+		}
 	}
 
 	// Read the masking key if the frame is masked
@@ -322,15 +328,21 @@ func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frame WebSocketFram
 			payloadBuffer[i] ^= maskingKey[i%4]
 		}
 	}
-	return WebSocketFrame{fin: fin, opcode: opcode, payload: payloadBuffer[:payloadLength]}, nil
+	return WebSocketFrame{
+		fin:     fin,
+		opcode:  opcode,
+		payload: payloadBuffer[:payloadLength],
+	}, nil
 }
 
-func (s *WebSocketServer) writeWebSocketFrame(conn net.Conn, opcode byte, payload []byte) error {
+func (s *WebSocketServer) writeWebSocketFrame(conn net.Conn, frame *WebSocketFrame) error {
 
-	payloadLen := len(payload)
+	payloadLen := len(frame.payload)
 
 	// Always send single fragment for now
-	opcode |= 0x80
+	if frame.fin {
+		frame.opcode |= 0x80
+	}
 
 	// Prepare the length bytes
 	var lengthBytes []byte
@@ -343,7 +355,7 @@ func (s *WebSocketServer) writeWebSocketFrame(conn net.Conn, opcode byte, payloa
 			byte(payloadLen >> 32), byte(payloadLen >> 24), byte(payloadLen >> 16), byte(payloadLen >> 8), byte(payloadLen)}
 	}
 
-	frameHeader := append([]byte{opcode}, lengthBytes...)
+	frameHeader := append([]byte{frame.opcode}, lengthBytes...)
 
 	if s.config.MaskServerMessages {
 		maskKey := make([]byte, 4)
@@ -352,7 +364,7 @@ func (s *WebSocketServer) writeWebSocketFrame(conn net.Conn, opcode byte, payloa
 		frameHeader = append(frameHeader, maskKey...)
 
 		for i := 0; i < payloadLen; i++ {
-			payload[i] ^= maskKey[i%4]
+			frame.payload[i] ^= maskKey[i%4]
 		}
 	}
 
@@ -366,7 +378,7 @@ func (s *WebSocketServer) writeWebSocketFrame(conn net.Conn, opcode byte, payloa
 		defer s.bufferPool.Put(frameBuffer)
 	}
 	copy(frameBuffer, frameHeader)
-	copy(frameBuffer[len(frameHeader):], payload)
+	copy(frameBuffer[len(frameHeader):], frame.payload)
 
 	_, err := conn.Write(frameBuffer[:frameLength])
 	return err
@@ -376,18 +388,16 @@ func (s *WebSocketServer) handleWebSocket(conn net.Conn) {
 	defer conn.Close()
 
 	readCh := make(chan []byte)
-	writeCh := make(chan []byte)
-	writeChTxt := make(chan []byte)
+	writeCh := make(chan WebSocketFrame)
 	closeCh := make(chan struct{})
 	closeDone := make(chan struct{})
 
 	wsConn := WebSocketConnection{
-		conn:       conn,
-		readCh:     readCh,
-		writeCh:    writeCh,
-		writeChTxt: writeChTxt,
-		closeCh:    closeCh,
-		closeDone:  closeDone,
+		conn:      conn,
+		readCh:    readCh,
+		writeCh:   writeCh,
+		closeCh:   closeCh,
+		closeDone: closeDone,
 	}
 	go s.readWebSocketData(&wsConn)
 	go s.writeWebSocketData(&wsConn)
@@ -405,7 +415,11 @@ func (s *WebSocketServer) closeConn(reason string, status uint16, wsConn *WebSoc
 	binary.BigEndian.PutUint16(closePayload, status)
 	copy(closePayload[2:], reason)
 
-	err := s.writeWebSocketFrame(wsConn.conn, OpClose, closePayload)
+	err := s.writeWebSocketFrame(wsConn.conn, &WebSocketFrame{
+		opcode:  OpClose,
+		fin:     true,
+		payload: closePayload,
+	})
 
 	if err != nil {
 		return err
@@ -425,11 +439,12 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 	closeCh := wsConn.closeCh
 
 	writeCh := wsConn.writeCh
-	writeChTxt := wsConn.writeChTxt
 	finalPayload := make([]byte, 0, defaultPayloadInitialBufferSize)
+
 	var overWriteOpcode byte
 	prevWasFinBinOrText := true
 	nextCantBeBinOrText := false
+
 	for {
 		frame, err := s.readWebSocketFrame(conn)
 
@@ -473,10 +488,16 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 				return
 			}
 
-			err := s.writeWebSocketFrame(conn, OpPong, payload)
+			err := s.writeWebSocketFrame(conn, &WebSocketFrame{
+				opcode:  OpPong,
+				payload: payload,
+				fin:     true,
+			})
+
 			if err != nil {
 				s.config.Logger.Println("Error sending pong frame:", err)
 			}
+
 			continue
 		} else if opcode == OpClose { // we received close, close immediately
 			var returnStatus uint16
@@ -485,7 +506,7 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 			} else {
 				if len(payload) > 0 {
 					code := binary.BigEndian.Uint16(payload[:2])
-					if (code >= 0 && code <= 999) || (code >= 1004 && code <= 1006) || (code >= 1015 && code <= 2999) || code >= 5000 {
+					if !webSocketCodeIsValid(code) {
 						returnStatus = 1002
 					} else {
 						returnStatus = 1000
@@ -517,15 +538,23 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 				return
 			}
 
-			outputMessageHandler := s.useMessageHandler(finalPayload, OpText)
-			if outputMessageHandler != nil {
-				writeChTxt <- outputMessageHandler
+			outputMessage := s.useMessageHandler(finalPayload, OpText)
+			if outputMessage != nil {
+				writeCh <- WebSocketFrame{
+					fin:     true,
+					opcode:  OpText,
+					payload: outputMessage,
+				}
 			}
 			finalPayload = make([]byte, 0, defaultPayloadInitialBufferSize)
 		case OpBinary:
-			outputMessageHandler := s.useMessageHandler(finalPayload, OpBinary)
-			if outputMessageHandler != nil {
-				writeCh <- outputMessageHandler
+			outputMessage := s.useMessageHandler(finalPayload, OpBinary)
+			if outputMessage != nil {
+				writeCh <- WebSocketFrame{
+					fin:     true,
+					opcode:  OpBinary,
+					payload: outputMessage,
+				}
 			}
 			finalPayload = make([]byte, 0, defaultPayloadInitialBufferSize)
 		default:
@@ -558,20 +587,13 @@ func (s *WebSocketServer) useMessageHandler(message []byte, messageType OpCode) 
 func (s *WebSocketServer) writeWebSocketData(wsConn *WebSocketConnection) {
 	conn := wsConn.conn
 	writeCh := wsConn.writeCh
-	writeChTxt := wsConn.writeChTxt
 	closeCh := wsConn.closeCh
 	closeDone := wsConn.closeDone
 
 	for {
 		select {
-		case payloadTxt := <-writeChTxt:
-			err := s.writeWebSocketFrame(conn, OpText, payloadTxt)
-			if err != nil {
-				close(closeCh)
-				return
-			}
-		case payload := <-writeCh:
-			err := s.writeWebSocketFrame(conn, OpBinary, payload)
+		case frame := <-writeCh:
+			err := s.writeWebSocketFrame(conn, &frame)
 			if err != nil {
 				close(closeCh)
 				return
