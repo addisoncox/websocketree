@@ -54,6 +54,12 @@ type WebSocketServer struct {
 	bufferPool     FrameBufferPool
 }
 
+type WebSocketFrame struct {
+	fin     bool
+	opcode  OpCode
+	payload []byte
+}
+
 type WebSocketServerConfig struct {
 	OnMessageHandler       func([]byte) []byte
 	OnBinaryMessageHandler func([]byte) []byte
@@ -223,7 +229,7 @@ func generateWebSocketHandshakeResponse(r *http.Request) (map[string]string, err
 	return responseHeaders, nil
 }
 
-func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frameFin bool, frameOpcode OpCode, framePayload []byte, frameErr error) {
+func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frame WebSocketFrame, frameErr error) {
 	// Read the initial two bytes of the WebSocket frame to determine the opcode and mask flag
 
 	header := make([]byte, 1)
@@ -232,11 +238,11 @@ func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frameFin bool, fram
 	header2 := make([]byte, 1)
 	_, err = conn.Read(header2)
 	if err != nil {
-		return true, 0, nil, err
+		return WebSocketFrame{}, err
 	}
 
 	if (header[0] & 0x70) != 0 {
-		return true, 0, nil, errors.New("RSV must be 0")
+		return WebSocketFrame{}, errors.New("RSV must be 0")
 	}
 	// Get the opcode from the first 4 bits of the first byte
 	opcode := header[0] & 0xf
@@ -255,7 +261,7 @@ func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frameFin bool, fram
 		_, err := conn.Read(extendedLen)
 
 		if err != nil {
-			return true, 0, nil, err
+			return WebSocketFrame{}, err
 		}
 		payloadLength = int(extendedLen[0])<<8 | int(extendedLen[1])
 	} else if payloadLength == 127 {
@@ -264,11 +270,11 @@ func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frameFin bool, fram
 			octet := make([]byte, 1)
 			n, err := conn.Read(octet)
 			if err != nil {
-				return true, 0, nil, err
+				return WebSocketFrame{}, err
 			}
 			if n != 1 {
 				// Handle the case where we couldn't read a single octet
-				return true, 0, nil, errors.New("io short read")
+				return WebSocketFrame{}, errors.New("Unexpected EOF on read")
 			}
 			extendedLen = append(extendedLen, octet...)
 		}
@@ -288,50 +294,35 @@ func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frameFin bool, fram
 			octet := make([]byte, 1)
 			n, err := conn.Read(octet)
 			if err != nil {
-				return true, 0, nil, err
+				return WebSocketFrame{}, err
 			}
 			if n != 1 {
 				// Handle the case where we couldn't read a single octet
-				return true, 0, nil, errors.New("io short read")
+				return WebSocketFrame{}, errors.New("Unexpected EOF on read")
 			}
 			maskingKey = append(maskingKey, octet...)
 		}
 	}
 
-	var payload []byte
+	var payloadBuffer []byte
 	if payloadLength < s.config.BufferSize {
-		payload = s.bufferPool.Get()
-		defer s.bufferPool.Put(payload)
+		payloadBuffer = s.bufferPool.Get()
+		defer s.bufferPool.Put(payloadBuffer)
 	} else {
-		payload = make([]byte, payloadLength, payloadLength)
+		payloadBuffer = make([]byte, payloadLength, payloadLength)
 	}
 
-	_, err = io.ReadFull(conn, payload[:payloadLength])
+	_, err = io.ReadFull(conn, payloadBuffer[:payloadLength])
 	if err != nil {
-		return true, 0, nil, err
+		return WebSocketFrame{}, err
 	}
 
 	if mask {
 		for i := 0; i < payloadLength; i++ {
-			payload[i] ^= maskingKey[i%4]
+			payloadBuffer[i] ^= maskingKey[i%4]
 		}
 	}
-	switch opcode {
-	case 0x0:
-		return fin, OpContinuation, payload[:payloadLength], nil
-	case 0x1:
-		return fin, OpText, payload[:payloadLength], nil
-	case 0x2:
-		return fin, OpBinary, payload[:payloadLength], nil
-	case 0x8:
-		return fin, OpClose, payload[:payloadLength], nil
-	case 0x9:
-		return fin, OpPing, payload[:payloadLength], nil
-	case 0xA:
-		return fin, OpPong, payload[:payloadLength], nil
-	default:
-		return fin, opcode, payload[:payloadLength], nil
-	}
+	return WebSocketFrame{fin: fin, opcode: opcode, payload: payloadBuffer[:payloadLength]}, nil
 }
 
 func (s *WebSocketServer) writeWebSocketFrame(conn net.Conn, opcode byte, payload []byte) error {
@@ -440,14 +431,19 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 	prevWasFinBinOrText := true
 	nextCantBeBinOrText := false
 	for {
+		frame, err := s.readWebSocketFrame(conn)
 
-		fin, opcode, payload, err := s.readWebSocketFrame(conn)
 		if err != nil {
 			if err.Error() == "RSV must be 0" {
 				s.closeConn("Not zero RSV not expected", 1002, wsConn)
 				return
 			}
 		}
+
+		fin := frame.fin
+		opcode := frame.opcode
+		payload := frame.payload
+
 		if prevWasFinBinOrText && opcode == OpContinuation {
 			s.closeConn("Received unexpected continuation", 1002, wsConn)
 			return
