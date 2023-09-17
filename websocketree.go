@@ -11,6 +11,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"unicode/utf8"
 )
 
@@ -69,6 +72,7 @@ type WebSocketServerConfig struct {
 	BufferSize            int
 	DisableUtf8Validation bool
 	MaskServerMessages    bool
+	DisableLogging        bool
 	Logger                *log.Logger
 }
 
@@ -97,9 +101,19 @@ func (s *WebSocketServer) Run() {
 	s.bufferPool = *NewFrameBufferPool(s.config.BufferPoolSize, s.config.BufferSize)
 	http.HandleFunc("/", s.handleWebSocketUpgrade)
 
+	go func() {
+		signalChan := make(chan os.Signal, 1)
+		signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+		<-signalChan
+
+		s.log("Stopping WebSocket server")
+		os.Exit(1)
+	}()
+
+	s.log("Starting WebSocket server")
 	err := http.ListenAndServe(s.addr, nil)
 	if err != nil {
-		s.config.Logger.Fatal("Error starting the server:", err)
+		s.log(fmt.Sprintf("Error starting the server: %s", err))
 	}
 }
 
@@ -201,7 +215,7 @@ func (s *WebSocketServer) handleWebSocketUpgrade(w http.ResponseWriter, r *http.
 	}
 
 	// Now the connection has been upgraded to WebSocket
-	s.config.Logger.Println("WebSocket connection established!")
+	s.log("WebSocket connection established!")
 
 	// Start handling WebSocket frames asynchronously
 	go s.handleWebSocket(conn)
@@ -232,6 +246,14 @@ func generateWebSocketHandshakeResponse(r *http.Request) (map[string]string, err
 	}
 
 	return responseHeaders, nil
+}
+
+func (s *WebSocketServer) log(msg string) {
+	if s.config.DisableLogging == true {
+		return
+	} else {
+		s.config.Logger.Println(msg)
+	}
 }
 
 func (s *WebSocketServer) readWebSocketFrame(conn net.Conn) (frame WebSocketFrame, frameErr error) {
@@ -405,7 +427,7 @@ func (s *WebSocketServer) handleWebSocket(conn net.Conn) {
 	// Wait for the close signal from either the read or write goroutines
 	select {
 	case <-closeDone:
-		s.config.Logger.Println("WebSocket connection closed")
+		s.log("WebSocket connection closed")
 	}
 }
 
@@ -449,10 +471,8 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 		frame, err := s.readWebSocketFrame(conn)
 
 		if err != nil {
-			if err.Error() == "RSV must be 0" {
-				s.closeConn("Not zero RSV not expected", 1002, wsConn)
-				return
-			}
+			s.closeConn(err.Error(), 1002, wsConn)
+			return
 		}
 
 		fin := frame.fin
@@ -480,7 +500,7 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 			if len(payload) > 125 {
 				err = s.closeConn("Ping payload can not be greater than 125 bytes: Closing connection", 1002, wsConn)
 				if err != nil {
-					s.config.Logger.Fatal(err.Error())
+					s.log(err.Error())
 				}
 				return
 			} else if !fin {
@@ -495,7 +515,7 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 			})
 
 			if err != nil {
-				s.config.Logger.Println("Error sending pong frame:", err)
+				s.log(fmt.Sprintf("Error sending pong frame: %s", err))
 			}
 
 			continue
@@ -517,8 +537,7 @@ func (s *WebSocketServer) readWebSocketData(wsConn *WebSocketConnection) {
 			}
 			s.closeConn("Connection closed by the server", returnStatus, wsConn)
 			return
-		} else if opcode == OpPong { // acknowledge pong immediately
-			s.config.Logger.Println("Received pong frame with payload:", payload)
+		} else if opcode == OpPong {
 			continue
 		}
 
@@ -584,6 +603,7 @@ func (s *WebSocketServer) useMessageHandler(message []byte, messageType OpCode) 
 	}
 	return nil
 }
+
 func (s *WebSocketServer) writeWebSocketData(wsConn *WebSocketConnection) {
 	conn := wsConn.conn
 	writeCh := wsConn.writeCh
